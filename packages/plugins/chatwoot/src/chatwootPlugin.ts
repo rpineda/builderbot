@@ -110,6 +110,10 @@ class SimpleQueue {
 const MEDIA_ROUTE = '/media'
 const MEDIA_DIR_NAME = join('tmp', 'chatwoot-media')
 
+/**
+ * Chatwoot Plugin for BuilderBot.
+ * Enables two-way sync between WhatsApp (via BuilderBot) and Chatwoot.
+ */
 class ChatwootPlugin {
     private api: ChatwootApi
     private config: ChatwootPluginConfig
@@ -120,21 +124,66 @@ class ChatwootPlugin {
     private mediaDir: string | null = null
     private mediaBaseUrl: string | null = null
 
+    /** Set to track processed webhook messages and avoid duplicates */
+    private sentMessagesCache = new Set<string>()
+
     /** False if Chatwoot credentials are invalid or unreachable. All operations are skipped when false. */
     public status = true
 
+    /**
+     * Creates a new ChatwootPlugin instance.
+     * @param config - Configuration object with token, url, accountId, and optional settings
+     */
     constructor(config: ChatwootPluginConfig) {
         this.config = config
         this.api = new ChatwootApi(config)
     }
 
     /**
-     * Conecta el plugin al bot. Una sola línea y listo.
+     * Generates a unique key for message deduplication.
+     * @param phone - User's phone number
+     * @param content - Message content
+     * @returns A unique key combining phone, content, and timestamp
+     */
+    private generateMessageKey(phone: string, content: string): string {
+        return `${phone}:${content}:${Date.now()}`
+    }
+
+    /**
+     * Checks if a message has already been processed.
+     * @param messageKey - The unique message key to check
+     * @returns True if the message was already processed
+     */
+    private isMessageProcessed(messageKey: string): boolean {
+        return this.sentMessagesCache.has(messageKey)
+    }
+
+    /**
+     * Marks a message as processed and schedules its removal from cache after 60 seconds.
+     * @param messageKey - The unique message key to mark as processed
+     */
+    private markMessageProcessed(messageKey: string): void {
+        this.sentMessagesCache.add(messageKey)
+        setTimeout(() => this.sentMessagesCache.delete(messageKey), 60000)
+    }
+
+    /**
+     * Connects the plugin to the bot. Single line and done.
      *
      * ```ts
      * const bot = await createBot({ flow, provider, database })
      * await chatwoot.attach(bot)
      * ```
+     *
+     * This method:
+     * - Validates Chatwoot credentials
+     * - Creates or finds the configured inbox
+     * - Registers the webhook endpoint if webhookUrl is configured
+     * - Registers the media serving endpoint for file attachments
+     * - Sets up event listeners for incoming and outgoing messages
+     *
+     * @param bot - The BuilderBot CoreClass instance
+     * @returns Promise that resolves when attachment is complete
      */
     async attach(bot: CoreClass): Promise<void> {
         const accountOk = await this.api.checkAccount()
@@ -244,10 +293,6 @@ class ChatwootPlugin {
                 let mediaUrl: string | null = payload.options?.media ?? null
                 let tempFilePath: string | null = null
 
-                // Fallback for providers (e.g. Baileys) that carry the raw WAMessage context
-                // but do not populate options.media. Download the file via provider.saveFile,
-                // save it to the public media directory and expose it as an HTTP asset so
-                // Chatwoot can fetch and store it by URL.
                 if (!mediaUrl && body && isMediaEvent(body)) {
                     const saveFile = (bot as any).provider?.saveFile
                     if (typeof saveFile === 'function') {
@@ -270,13 +315,6 @@ class ChatwootPlugin {
 
                 if (!body && !mediaUrl) return
 
-                // Prefer the real caption from the raw message context over the normalised label.
-                // When a user sends an image with text Baileys sets body to _event_media_ and
-                // stores the actual caption inside message.imageMessage.caption (and similar).
-                // If there is a media attachment but no caption, send empty content so Chatwoot
-                // shows just the image/file preview without a redundant [image] label.
-                // Only fall back to the event label when there is no media file at all
-                // (e.g. location, sticker, order — events that have no downloadable attachment).
                 const caption = extractCaption(payload)
                 const content = caption ?? (mediaUrl ? '' : normalizeBody(body ?? ''))
                 const conversationId = await this.resolveConversation(from, name)
@@ -292,7 +330,7 @@ class ChatwootPlugin {
     }
 
     /**
-     * Procesa un webhook entrante desde Chatwoot.
+     * Handles incoming webhooks from Chatwoot.
      *
      * Wire this to your HTTP route handler:
      * ```ts
@@ -305,6 +343,10 @@ class ChatwootPlugin {
      * Handles:
      * - `conversation_updated` + assignee change → add/remove phone from blacklist
      * - `message_created` outgoing on API channel → forward message to WhatsApp
+     *
+     * @param bot - The BuilderBot CoreClass instance
+     * @param body - The webhook payload from Chatwoot
+     * @returns Promise that resolves when webhook processing is complete
      */
     async handleWebhook(bot: CoreClass & ChatwootBotRef, body: ChatwootWebhookBody): Promise<void> {
         if (!this.inbox) return
@@ -338,7 +380,15 @@ class ChatwootPlugin {
         ) {
             const phone = body?.conversation?.meta?.sender?.phone_number?.replace('+', '')
             const content = body?.content ?? ''
+            const messageId = body?.message?.id
             const attachments = body?.attachments ?? []
+
+            const messageKey = `webhook:${phone}:${content}:${messageId}`
+            if (this.isMessageProcessed(messageKey)) {
+                console.log(`[Chatwoot] Skipping duplicate webhook message: ${messageId}`)
+                return
+            }
+            this.markMessageProcessed(messageKey)
 
             if (phone && (content || attachments.length)) {
                 const firstMedia = attachments[0]?.data_url ?? null
@@ -354,7 +404,13 @@ class ChatwootPlugin {
     }
 
     /**
-     * Resuelve (o crea) el contacto y la conversación en Chatwoot para un número dado.
+     * Resolves (or creates) the contact and conversation in Chatwoot for a given phone number.
+     * Uses internal caches to avoid redundant API calls.
+     *
+     * @param phone - User's phone number (without + prefix)
+     * @param name - Optional user name for contact creation
+     * @returns The Chatwoot conversation ID
+     * @throws Error if contact or conversation cannot be resolved
      */
     private async resolveConversation(phone: string, name?: string): Promise<number> {
         const cached = this.conversationCache.get(phone)
@@ -376,14 +432,19 @@ class ChatwootPlugin {
     }
 
     /**
-     * Acceso directo a la API de Chatwoot para operaciones avanzadas.
+     * Provides direct access to the Chatwoot API for advanced operations.
+     * Use this to perform custom API calls not exposed by the plugin.
+     *
+     * @returns The ChatwootApi instance
      */
     getApi(): ChatwootApi {
         return this.api
     }
 
     /**
-     * Retorna el inbox creado por el plugin.
+     * Returns the inbox created by the plugin.
+     *
+     * @returns The ChatwootInbox instance or null if not attached yet
      */
     getInbox(): ChatwootInbox | null {
         return this.inbox
@@ -391,19 +452,26 @@ class ChatwootPlugin {
 }
 
 /**
- * Crea una instancia del plugin de Chatwoot.
+ * Creates a Chatwoot plugin instance for BuilderBot.
  *
+ * This function creates a new ChatwootPlugin configured to sync messages between
+ * BuilderBot (WhatsApp) and Chatwoot.
+ *
+ * @example
  * ```ts
  * const chatwoot = createChatwootPlugin({
- *     token: 'tu-token',
+ *     token: 'your-token',
  *     url: 'https://app.chatwoot.com',
  *     accountId: 1,
- *     webhookUrl: 'https://mi-bot.example.com/v1/chatwoot',
+ *     webhookUrl: 'https://my-bot.example.com/v1/chatwoot',
  * })
  *
  * const bot = await createBot({ flow, provider, database })
  * await chatwoot.attach(bot)
  * ```
+ *
+ * @param config - Configuration object for the Chatwoot plugin
+ * @returns A configured ChatwootPlugin instance
  */
 const createChatwootPlugin = (config: ChatwootPluginConfig): ChatwootPlugin => {
     return new ChatwootPlugin(config)

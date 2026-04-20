@@ -107,6 +107,11 @@ export interface ChatwootWebhookBody {
     content?: string
     attachments?: Array<{ data_url?: string; [key: string]: unknown }>
     changed_attributes?: Array<Record<string, unknown>>
+    message?: {
+        id?: number
+        content?: string
+        message_type?: string
+    }
     meta?: {
         sender?: { phone_number?: string; name?: string }
         assignee?: { id?: number } | null
